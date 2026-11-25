@@ -1,16 +1,10 @@
 """
-Information Storage and Retrieval - PySpark IR application
-CORE ENGINE (shared by the command-line app and the GUI)
+Information Retrieval project - main functions (PySpark)
 
-Pipeline
-  1. Import a folder of .txt documents (any names, any number)
-  2. Build the Positional Index with PySpark (RDD transformations)
-  3. Compute TF, DF, IDF, TF-IDF, document vector lengths, normalized TF-IDF
-  4. Process queries: term search, phrase queries, Boolean AND / AND NOT
-  5. Compute query-document similarity (cosine) and rank the results
-
-Nothing is hard-coded: N, the documents and the vocabulary all come from the
-folder that the user selects.
+1. read_documents()        Spark reads the .txt files of a folder
+2. build_index()           Spark builds the Positional Index
+3. calculate_weights()     TF, DF, IDF, TF-IDF, vector lengths, normalized TF-IDF
+4. search()                term / phrase / Boolean (AND, AND NOT) + similarity + ranking
 """
 import glob
 import math
@@ -23,372 +17,300 @@ os.environ["PYSPARK_PYTHON"] = sys.executable
 os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
 
-
-def find_hadoop_home():
-    """
-    On Windows, Spark needs winutils.exe + hadoop.dll (in <HADOOP_HOME>\\bin) to read files itself.
-    Look for them in the usual places so the user does not have to set anything.
-    Returns the HADOOP_HOME folder, or None.
-    """
-    here = os.path.dirname(os.path.abspath(__file__))
+def set_hadoop_home():
+    # On Windows Spark needs winutils.exe and hadoop.dll to read files.
+    # Look for a folder like hadoop-3.0.0 (with bin\winutils.exe) in the usual places.
+    if sys.platform != "win32":
+        return
     home = os.path.expanduser("~")
-    candidates = [os.environ.get("HADOOP_HOME", ""),
-                  os.path.join(here, "hadoop"), r"C:\hadoop", r"C:\winutils",
-                  r"C:\winutils\hadoop-3.0.0", r"C:\hadoop-3.0.0"]
-    for pattern in [os.path.join(home, "Downloads", "*", "hadoop-3*"),
-                    os.path.join(home, "Downloads", "*", "*", "hadoop-3*"),
-                    os.path.join(home, "Downloads", "hadoop-3*"),
-                    os.path.join(home, "Desktop", "*", "hadoop-3*"),
-                    os.path.join(home, "Documents", "*", "hadoop-3*")]:
-        candidates += sorted(glob.glob(pattern), reverse=True)   # newest version first
-    for c in candidates:
-        if c and os.path.isfile(os.path.join(c, "bin", "winutils.exe")):
-            return c
-    return None
+    places = [os.environ.get("HADOOP_HOME", ""), r"C:\hadoop",
+              os.path.join(os.path.dirname(os.path.abspath(__file__)), "hadoop")]
+    places += glob.glob(os.path.join(home, "Downloads", "*", "hadoop-3*"))
+    places += glob.glob(os.path.join(home, "Downloads", "*", "*", "hadoop-3*"))
+    for p in places:
+        if p and os.path.isfile(os.path.join(p, "bin", "winutils.exe")):
+            os.environ["HADOOP_HOME"] = p
+            os.environ["PATH"] = os.path.join(p, "bin") + os.pathsep + os.environ["PATH"]
+            return
 
 
-if sys.platform == "win32":
-    _hh = find_hadoop_home()
-    if _hh:
-        os.environ["HADOOP_HOME"] = _hh
-        os.environ["hadoop.home.dir"] = _hh
-        os.environ["PATH"] = os.path.join(_hh, "bin") + os.pathsep + os.environ.get("PATH", "")
-
+set_hadoop_home()
 from pyspark.sql import SparkSession  # noqa: E402
 
-TOKEN_PATTERN = r"[^\W_]+"
+spark = None
 
 
-def natural_key(name):
-    """Sort d2 before d10, file2 before file10."""
-    return [int(p) if p.isdigit() else p.lower() for p in re.split(r"(\d+)", name)]
-
-
-def tokenize_text(text):
-    return re.findall(TOKEN_PATTERN, text.lower())
-
-
-
-# Spark session
-_spark = None
-
-
-def get_spark():
-    global _spark
-    if _spark is None:
-        _spark = (SparkSession.builder.appName("IR_PositionalIndex")
-                  .master("local[*]")
-                  .config("spark.ui.showConsoleProgress", "false")
-                  .getOrCreate())
-        _spark.sparkContext.setLogLevel("ERROR")
-    return _spark
+def get_sc():
+    """Start Spark (once) and return the SparkContext."""
+    global spark
+    if spark is None:
+        spark = SparkSession.builder.appName("IR").master("local[*]").getOrCreate()
+        spark.sparkContext.setLogLevel("ERROR")
+    return spark.sparkContext
 
 
 def stop_spark():
-    global _spark
-    if _spark is not None:
-        _spark.stop()
-        _spark = None
+    global spark
+    if spark is not None:
+        spark.stop()
+        spark = None
 
 
-class IREngine:
-    def __init__(self):
-        self.folder = None
-        self.read_mode = None       # how the files were read (for the log)
-        self.read_error = ""        # why Spark could not read the folder itself (if it failed)
-        self.docs = []              # [(doc_id, text)]
-        self.doc_ids = []
-        self.N = 0
-        self.pos_index = {}         # term -> {doc: [positions]}
-        self.terms = []
-        self.raw_tf = {}
-        self.w_tf = {}
-        self.df = {}
-        self.idf = {}
-        self.tfidf = {}
-        self.doc_len = {}
-        self.norm = {}
-
-    # 1. Dataset import(PySpark reads the folder)
-    def load_folder(self, folder, force_python_read=False):
-        folder = os.path.abspath(folder)
-        if not os.path.isdir(folder):
-            raise ValueError(f"Folder not found: {folder}")
-        files = sorted(glob.glob(os.path.join(folder, "*.txt")))
-        if not files:
-            raise ValueError(f"No .txt files found in: {folder}")
-
-        sc = get_spark().sparkContext
-        docs = None
-        if not force_python_read:
-            try:
-                uri = "file:///" + folder.replace("\\", "/").lstrip("/")
-                rdd = sc.wholeTextFiles(uri + "/*.txt")
-                rdd = rdd.map(lambda kv: (kv[0].replace("\\", "/").split("/")[-1], kv[1]))
-                docs = rdd.collect()          # triggers the read
-                docs = [(unquote(name), text) for name, text in docs]
-                self.read_mode = "Spark wholeTextFiles"
-            except Exception as e:
-                docs = None                   # e.g. winutils / hadoop.dll missing on Windows
-                lines = [l.strip() for l in str(e).splitlines() if l.strip()]
-                pick = next((l for l in lines[1:] if re.search(r"(Exception|Error)", l)),
-                            lines[0] if lines else type(e).__name__)
-                self.read_error = pick[:200]
-        if docs is None:
-            # Fallback: read with Python, then hand the documents to Spark
-            docs = []
-            for path in files:
-                with open(path, encoding="utf-8", errors="replace") as f:
-                    docs.append((os.path.basename(path), f.read()))
-            self.read_mode = "Python read + Spark parallelize"
-
-        docs = [(name[:-4] if name.lower().endswith(".txt") else name, text)
-                for name, text in docs]
-        docs.sort(key=lambda x: natural_key(x[0]))
-        self.folder = folder
-        self.docs = docs
-        self.doc_ids = [d for d, _ in docs]
-        self.N = len(docs)
-        return self.N
+def words_of(text):
+    """Lowercase the text and split it into words (punctuation is removed)."""
+    return re.findall(r"[^\W_]+", text.lower())
 
 
-    # 2. Positional index with PySpark
-    def build_index(self):
-        sc = get_spark().sparkContext
-        pattern = TOKEN_PATTERN
+def natural_key(name):
+    """So that d2 comes before d10."""
+    return [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", name.lower())]
 
-        def tokenize(doc):
-            import re
-            doc_id, text = doc
-            tokens = re.findall(pattern, text.lower())
-            return [((t, doc_id), pos) for pos, t in enumerate(tokens, start=1)]
 
-        docs_rdd = sc.parallelize(self.docs, max(1, min(self.N, 8)))
-        index_rdd = (
-            docs_rdd.flatMap(tokenize)                                  # ((term, doc), position)
-                    .groupByKey()                                       # ((term, doc), [positions])
-                    .mapValues(lambda ps: sorted(ps))
-                    .map(lambda kv: (kv[0][0], (kv[0][1], kv[1])))      # (term, (doc, positions))
-                    .groupByKey()
-                    .mapValues(list)
-                    .sortByKey()
-        )
-        index = {}
-        for term, lst in index_rdd.collect():
-            lst.sort(key=lambda x: natural_key(x[0]))
-            index[term] = {d: ps for d, ps in lst}
-        self.pos_index = index
-        self.terms = sorted(index)
-        self._compute_weights()
+# ---------------------------------------------------------------------------
+# 1. Read the documents
+# ---------------------------------------------------------------------------
+def read_documents(folder):
+    """Return ([(doc_id, text), ...], how the files were read)."""
+    folder = os.path.abspath(folder)
+    files = glob.glob(os.path.join(folder, "*.txt"))
+    if not files:
+        raise ValueError("No .txt files were found in this folder.")
+    sc = get_sc()
+    try:
+        path = "file:///" + folder.replace("\\", "/").lstrip("/") + "/*.txt"
+        rdd = sc.wholeTextFiles(path).map(lambda kv: (kv[0].split("/")[-1], kv[1]))
+        docs = [(unquote(name), text) for name, text in rdd.collect()]
+        how = "Spark wholeTextFiles"
+    except Exception:
+        # Spark could not read the folder (usually winutils is missing on Windows)
+        docs = []
+        for f in files:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                docs.append((os.path.basename(f), fh.read()))
+        how = "Python (Spark could not read the folder)"
+    docs = [(os.path.splitext(name)[0], text) for name, text in docs]
+    docs.sort(key=lambda d: natural_key(d[0]))
+    return docs, how
 
-    # ------------------------------------------------------------------
-    # 3. TF, DF, IDF, TF-IDF, lengths, normalization (from the index)
-    # ------------------------------------------------------------------
-    def _compute_weights(self):
-        ids, terms, N = self.doc_ids, self.terms, self.N
-        self.raw_tf = {t: {d: len(self.pos_index[t].get(d, [])) for d in ids} for t in terms}
-        self.w_tf = {t: {d: (1 + math.log10(self.raw_tf[t][d]) if self.raw_tf[t][d] > 0 else 0.0)
-                         for d in ids} for t in terms}
-        self.df = {t: len(self.pos_index[t]) for t in terms}
-        self.idf = {t: math.log10(N / self.df[t]) for t in terms}
-        self.tfidf = {t: {d: self.w_tf[t][d] * self.idf[t] for d in ids} for t in terms}
-        self.doc_len = {d: math.sqrt(sum(self.tfidf[t][d] ** 2 for t in terms)) for d in ids}
-        self.norm = {t: {d: (self.tfidf[t][d] / self.doc_len[d] if self.doc_len[d] else 0.0)
-                         for d in ids} for t in terms}
 
-    # ------------------------------------------------------------------
-    # Reports (plain text, used by both CMD and GUI)
-    # ------------------------------------------------------------------
-    def report_dataset(self):
-        w = max([len(d) for d in self.doc_ids] + [4]) + 2
-        lines = [f"{'File':<{w}}{'Words':>6}  Text (first 70 chars)"]
-        for d, text in self.docs:
-            toks = tokenize_text(text)
-            preview = " ".join(text.split())[:70]
-            lines.append(f"{d:<{w}}{len(toks):>6}  {preview}")
-        lines.append(f"\nN = {self.N} documents, {len(self.terms)} distinct terms"
-                     f"  (read with: {self.read_mode})")
-        if self.read_error:
-            lines.append("Note: Spark could not read the folder itself, so Python read the files "
-                         "and Spark built the index.\n"
-                         "      To let Spark read the files on Windows, see README.txt (winutils).\n"
-                         f"      Reason: {self.read_error}")
-        return "\n".join(lines)
+# ---------------------------------------------------------------------------
+# 2. Positional index with Spark
+# ---------------------------------------------------------------------------
+def build_index(docs):
+    """Return {term: {doc_id: [positions]}} (positions start at 1)."""
+    sc = get_sc()
 
-    def report_index(self):
-        w = max([len(t) for t in self.terms] + [4]) + 2
-        lines = []
-        for t in self.terms:
-            parts = "; ".join(f"{d}: {', '.join(map(str, self.pos_index[t][d]))}"
-                              for d in self.pos_index[t])
-            lines.append(f"{t:<{w}}{parts}")
-        return "\n".join(lines)
+    def tokenize(doc):
+        import re
+        doc_id, text = doc
+        words = re.findall(r"[^\W_]+", text.lower())
+        return [((w, doc_id), pos) for pos, w in enumerate(words, start=1)]
 
-    def _matrix(self, m, fmt="{:.4f}"):
-        w = max([len(t) for t in self.terms] + [4]) + 2
-        cw = max([len(d) for d in self.doc_ids] + [6]) + 2
-        lines = [f"{'Term':<{w}}" + "".join(f"{d:>{cw}}" for d in self.doc_ids)]
-        for t in self.terms:
-            row = "".join(f"{(fmt.format(m[t][d]) if m[t][d] else '0'):>{cw}}" for d in self.doc_ids)
-            lines.append(f"{t:<{w}}{row}")
-        return "\n".join(lines)
+    rdd = sc.parallelize(docs)
+    rdd = rdd.flatMap(tokenize)                                # ((term, doc), position)
+    rdd = rdd.groupByKey().mapValues(sorted)                   # ((term, doc), [positions])
+    rdd = rdd.map(lambda kv: (kv[0][0], (kv[0][1], kv[1])))    # (term, (doc, positions))
+    rdd = rdd.groupByKey().mapValues(list).sortByKey()         # (term, [(doc, positions), ...])
 
-    def report_raw_tf(self):
-        return self._matrix(self.raw_tf)
+    index = {}
+    for term, items in rdd.collect():
+        items.sort(key=lambda x: natural_key(x[0]))
+        index[term] = {doc: positions for doc, positions in items}
+    return index
 
-    def report_weighted_tf(self):
-        return self._matrix(self.w_tf)
 
-    def report_df_idf(self):
-        w = max([len(t) for t in self.terms] + [4]) + 2
-        lines = [f"{'Term':<{w}}{'DF':>5}{'IDF':>10}   (IDF = log10(N / DF), N = {self.N})"]
-        for t in self.terms:
-            lines.append(f"{t:<{w}}{self.df[t]:>5}{self.idf[t]:>10.4f}")
-        return "\n".join(lines)
+# ---------------------------------------------------------------------------
+# 3. TF, DF, IDF, TF-IDF, lengths, normalization
+# ---------------------------------------------------------------------------
+def calculate_weights(index, doc_ids):
+    N = len(doc_ids)
+    terms = sorted(index)
+    raw_tf, w_tf, tfidf, norm = {}, {}, {}, {}
+    df = {t: len(index[t]) for t in terms}
+    idf = {t: math.log10(N / df[t]) for t in terms}
 
-    def report_tfidf(self):
-        return self._matrix(self.tfidf)
+    for t in terms:
+        raw_tf[t], w_tf[t], tfidf[t] = {}, {}, {}
+        for d in doc_ids:
+            tf = len(index[t].get(d, []))                  # how many times t is in d
+            raw_tf[t][d] = tf
+            w_tf[t][d] = 1 + math.log10(tf) if tf > 0 else 0
+            tfidf[t][d] = w_tf[t][d] * idf[t]
 
-    def report_lengths(self):
-        w = max([len(d) for d in self.doc_ids] + [8]) + 2
-        lines = [f"{'Document':<{w}}Vector length"]
-        for d in self.doc_ids:
-            lines.append(f"{d:<{w}}{self.doc_len[d]:.4f}")
-        return "\n".join(lines)
+    # length of each document vector, then divide every weight by it
+    lengths = {d: math.sqrt(sum(tfidf[t][d] ** 2 for t in terms)) for d in doc_ids}
+    for t in terms:
+        norm[t] = {d: tfidf[t][d] / lengths[d] for d in doc_ids}
 
-    def report_normalized(self):
-        return self._matrix(self.norm)
+    return {"N": N, "terms": terms, "raw_tf": raw_tf, "w_tf": w_tf, "df": df, "idf": idf,
+            "tfidf": tfidf, "lengths": lengths, "norm": norm}
 
-    def all_reports(self):
-        sections = [
-            ("ASSIGNED DATASET", self.report_dataset()),
-            ("POSITIONAL INDEX", self.report_index()),
-            ("RAW TF", self.report_raw_tf()),
-            ("WEIGHTED TF: 1 + log10(TF)", self.report_weighted_tf()),
-            ("DF and IDF", self.report_df_idf()),
-            ("TF-IDF MATRIX", self.report_tfidf()),
-            ("DOCUMENT VECTOR LENGTHS", self.report_lengths()),
-            ("NORMALIZED TF-IDF MATRIX", self.report_normalized()),
-        ]
-        bar = "=" * 70
-        return "\n\n".join(f"{bar}\n{title}\n{bar}\n{body}" for title, body in sections)
 
-    # ------------------------------------------------------------------
-    # 4. Query processing
-    # ------------------------------------------------------------------
-    def _term_search(self, word):
-        return {d: list(ps) for d, ps in self.pos_index.get(word, {}).items()}
+def load_dataset(folder):
+    """Do steps 1-3 and return everything in one dictionary."""
+    docs, how = read_documents(folder)
+    doc_ids = [d for d, _ in docs]
+    index = build_index(docs)
+    ir = calculate_weights(index, doc_ids)
+    ir.update({"docs": docs, "doc_ids": doc_ids, "index": index, "read_with": how})
+    return ir
 
-    def _phrase_search(self, words):
-        if any(w not in self.pos_index for w in words):
-            return {}
-        candidates = set(self.pos_index[words[0]])
-        for w in words[1:]:
-            candidates &= set(self.pos_index[w])
-        result = {}
-        for d in candidates:
-            starts = [p for p in self.pos_index[words[0]][d]
-                      if all((p + i) in self.pos_index[words[i]][d] for i in range(1, len(words)))]
-            if starts:
-                result[d] = sorted(starts)
-        return dict(sorted(result.items(), key=lambda x: natural_key(x[0])))
 
-    def _operand(self, text):
-        words = tokenize_text(text)
-        if not words:
-            raise ValueError("Empty search term in the query.")
-        if len(words) == 1:
-            return {"text": " ".join(words), "words": words, "kind": "term",
-                    "matches": self._term_search(words[0])}
-        return {"text": " ".join(words), "words": words, "kind": "phrase",
-                "matches": self._phrase_search(words)}
+# ---------------------------------------------------------------------------
+# Tables as text
+# ---------------------------------------------------------------------------
+def matrix_text(ir, name):
+    terms, doc_ids = ir["terms"], ir["doc_ids"]
+    w = max(len(t) for t in terms) + 2
+    cw = max(len(d) for d in doc_ids) + 6
+    lines = ["Term".ljust(w) + "".join(d.rjust(cw) for d in doc_ids)]
+    for t in terms:
+        row = ""
+        for d in doc_ids:
+            value = ir[name][t][d]
+            row += (f"{value:.4f}" if value else "0").rjust(cw)
+        lines.append(t.ljust(w) + row)
+    return "\n".join(lines)
 
-    def search(self, query, mode="auto"):
-        """
-        mode: auto | term | phrase | boolean
-          term    -> one word
-          phrase  -> all words must appear next to each other, in order
-          boolean -> operands joined by AND / AND NOT (an operand is a word or a phrase)
-          auto    -> boolean if AND / AND NOT is present, else term (1 word) or phrase
-        """
-        if not self.pos_index:
-            raise ValueError("Build the index first (import a dataset folder).")
-        q = query.strip()
-        if not q:
-            raise ValueError("Please type a query.")
 
-        pieces = re.split(r"\s+(AND\s+NOT|AND)\s+", q, flags=re.IGNORECASE)
-        has_op = len(pieces) > 1
-        if mode == "term":
-            if len(tokenize_text(q)) != 1 or has_op:
-                raise ValueError("Term search expects exactly one word.")
-            pieces = [q]
-        elif mode == "phrase":
-            if has_op:
-                raise ValueError("Phrase mode does not use AND / AND NOT.")
-            pieces = [q]
-        elif mode == "boolean" and not has_op:
-            raise ValueError("Boolean mode needs AND or AND NOT, e.g.  a b AND c d")
+def tables(ir):
+    """All tables of the project as a list of (title, text)."""
+    index, terms = ir["index"], ir["terms"]
+    w = max(len(t) for t in terms) + 2
 
-        operands = [self._operand(p.strip().strip('"')) for p in pieces[0::2]]
-        ops = [re.sub(r"\s+", " ", p.upper()) for p in pieces[1::2]]
+    dataset = ["File".ljust(8) + "Words  Text"]
+    for d, text in ir["docs"]:
+        dataset.append(d.ljust(8) + str(len(words_of(text))).rjust(5) + "  " + " ".join(text.split())[:70])
+    dataset.append(f"\nN = {ir['N']} documents, {len(terms)} distinct terms "
+                   f"(files read with: {ir['read_with']})")
 
-        final = set(operands[0]["matches"])
-        positive_terms = list(operands[0]["words"])
-        for op, operand in zip(ops, operands[1:]):
-            if op == "AND":
-                final &= set(operand["matches"])
-                positive_terms += operand["words"]
-            else:                                   # AND NOT
-                final -= set(operand["matches"])
-        final = sorted(final, key=natural_key)
+    positional = []
+    for t in terms:
+        parts = [f"{d}: {', '.join(map(str, index[t][d]))}" for d in index[t]]
+        positional.append(t.ljust(w) + "; ".join(parts))
 
-        qvec = self._query_vector(positive_terms)
-        sims = {d: sum(w * self.norm[t][d] for t, w in qvec["normed"].items() if t in self.norm)
-                for d in final}
-        ranking = sorted(final, key=lambda d: (-sims[d], natural_key(d)))
-        kind = ("Boolean query" if ops else
-                "Term search" if operands[0]["kind"] == "term" else "Phrase query")
-        return {"query": q, "kind": kind, "operands": operands, "ops": ops,
-                "final": final, "qvec": qvec, "sims": sims, "ranking": ranking}
+    df_idf = ["Term".ljust(w) + "DF".rjust(4) + "IDF".rjust(10) + f"   (IDF = log10({ir['N']} / DF))"]
+    for t in terms:
+        df_idf.append(t.ljust(w) + str(ir["df"][t]).rjust(4) + f"{ir['idf'][t]:.4f}".rjust(10))
 
-    def _query_vector(self, terms):
-        counts = {}
-        for t in terms:
-            counts[t] = counts.get(t, 0) + 1
-        wtf = {t: 1 + math.log10(c) for t, c in counts.items()}
-        raw = {t: wtf[t] * self.idf.get(t, 0.0) for t in counts}
-        length = math.sqrt(sum(v ** 2 for v in raw.values()))
-        normed = {t: (v / length if length else 0.0) for t, v in raw.items()}
-        return {"wtf": wtf, "raw": raw, "length": length, "normed": normed}
+    lengths = ["Document   Vector length"]
+    for d in ir["doc_ids"]:
+        lengths.append(d.ljust(11) + f"{ir['lengths'][d]:.4f}")
 
-    def format_result(self, res):
-        out = []
-        bar = "=" * 70
-        out.append(f"{bar}\n{res['kind'].upper()}: {res['query']}\n{bar}")
-        for i, operand in enumerate(res["operands"]):
-            label = "" if i == 0 else f"[{res['ops'][i - 1]}] "
-            out.append(f"{label}{operand['kind']} \"{operand['text']}\" -> "
-                       + (", ".join(operand["matches"]) or "no match"))
-            if operand["kind"] == "phrase" and operand["matches"]:
-                n = len(operand["words"])
-                for d, starts in operand["matches"].items():
-                    rng = ", ".join(f"{s}-{s + n - 1}" for s in starts)
-                    out.append(f"      {d}: start positions {', '.join(map(str, starts))}"
-                               f"  (token ranges {rng})")
-            elif operand["kind"] == "term" and operand["matches"]:
-                for d, ps in operand["matches"].items():
-                    out.append(f"      {d}: positions {', '.join(map(str, ps))}")
-        out.append("")
-        out.append("Matching documents: " + (", ".join(res["final"]) if res["final"] else "(none)"))
-        qv = res["qvec"]
-        out.append(f"\nQuery vector length = {qv['length']:.6f}")
-        out.append(f"{'Query term':<14}{'Weighted TF':>12}{'Query TF-IDF':>14}{'Normalized':>12}")
-        for t in qv["raw"]:
-            out.append(f"{t:<14}{qv['wtf'][t]:>12.4f}{qv['raw'][t]:>14.4f}{qv['normed'][t]:>12.4f}")
-        if res["final"]:
-            out.append(f"\n{'Matched doc':<14}{'Similarity':>12}")
-            for d in res["final"]:
-                out.append(f"{d:<14}{res['sims'][d]:>12.4f}")
-            out.append("Ranking (highest similarity first): " + " > ".join(res["ranking"]))
-        return "\n".join(out)
+    return [("Dataset", "\n".join(dataset)),
+            ("Positional Index", "\n".join(positional)),
+            ("TF (raw)", matrix_text(ir, "raw_tf")),
+            ("TF (weighted) = 1 + log10(TF)", matrix_text(ir, "w_tf")),
+            ("DF and IDF", "\n".join(df_idf)),
+            ("TF-IDF", matrix_text(ir, "tfidf")),
+            ("Vector lengths", "\n".join(lengths)),
+            ("Normalized TF-IDF", matrix_text(ir, "norm"))]
+
+
+# ---------------------------------------------------------------------------
+# 4. Search
+# ---------------------------------------------------------------------------
+def find(ir, words):
+    """Documents where the words appear next to each other, in this order.
+    Returns {doc_id: [start positions]}. One word = normal term search."""
+    index = ir["index"]
+    if any(w not in index for w in words):
+        return {}
+    docs = set(index[words[0]])
+    for w in words[1:]:
+        docs &= set(index[w])                       # documents that contain all the words
+    found = {}
+    for d in docs:
+        starts = []
+        for p in index[words[0]][d]:
+            # word number i must be at position p + i
+            if all((p + i) in index[words[i]][d] for i in range(1, len(words))):
+                starts.append(p)
+        if starts:
+            found[d] = starts
+    return dict(sorted(found.items(), key=lambda x: natural_key(x[0])))
+
+
+def search(ir, query):
+    """
+    Queries:   word            term search
+               word1 word2     phrase query
+               A AND B         Boolean AND   (A and B are words or phrases)
+               A AND NOT B     Boolean AND NOT
+    """
+    parts = re.split(r"\s+(AND NOT|AND)\s+", query.strip(), flags=re.IGNORECASE)
+    if len(parts) not in (1, 3):
+        raise ValueError("Use only one operator:  A AND B   or   A AND NOT B")
+    first = words_of(parts[0])
+    second = words_of(parts[2]) if len(parts) == 3 else None
+    if not first or second == []:
+        raise ValueError("Please type a word or a phrase on each side of the operator.")
+
+    found1 = find(ir, first)
+    found2 = find(ir, second) if second else None
+    operator = parts[1].upper() if second else None
+
+    # matching documents and the words of the query vector
+    if operator == "AND":
+        matching = set(found1) & set(found2)
+        query_words = first + second
+    elif operator == "AND NOT":
+        matching = set(found1) - set(found2)
+        query_words = first              # the excluded phrase is not part of the query vector
+    else:
+        matching = set(found1)
+        query_words = first
+    matching = sorted(matching, key=natural_key)
+
+    # query vector: weighted TF * IDF, then divide by its length
+    weights, counts = {}, {}
+    for w in dict.fromkeys(query_words):             # each word once, in query order
+        counts[w] = query_words.count(w)
+        weights[w] = (1 + math.log10(counts[w])) * ir["idf"].get(w, 0)
+    length = math.sqrt(sum(v ** 2 for v in weights.values()))
+    normalized = {w: (v / length if length else 0) for w, v in weights.items()}
+
+    # similarity = dot product of the query vector and the normalized document vector
+    sims = {}
+    for d in matching:
+        sims[d] = sum(normalized[w] * ir["norm"][w][d] for w in normalized if w in ir["norm"])
+    ranking = sorted(matching, key=lambda d: (-sims[d], natural_key(d)))
+
+    return {"query": query.strip(), "first": first, "second": second, "operator": operator,
+            "found1": found1, "found2": found2, "matching": matching, "counts": counts, "weights": weights,
+            "length": length, "normalized": normalized, "sims": sims, "ranking": ranking}
+
+
+def result_text(res):
+    def describe(label, words, found):
+        kind = "phrase" if len(words) > 1 else "term"
+        lines = [f'{label}{kind} "{" ".join(words)}" -> ' + (", ".join(found) or "no match")]
+        for d, starts in found.items():
+            if len(words) > 1:
+                ranges = ", ".join(f"{s}-{s + len(words) - 1}" for s in starts)
+                lines.append(f"      {d}: start positions {', '.join(map(str, starts))}"
+                             f"  (token ranges {ranges})")
+            else:
+                lines.append(f"      {d}: positions {', '.join(map(str, starts))}")
+        return lines
+
+    bar = "=" * 70
+    kind = ("BOOLEAN " + res["operator"]) if res["operator"] else \
+           ("PHRASE QUERY" if len(res["first"]) > 1 else "TERM SEARCH")
+    out = [bar, f"{kind}: {res['query']}", bar]
+    out += describe("", res["first"], res["found1"])
+    if res["second"]:
+        out += describe(f"[{res['operator']}] ", res["second"], res["found2"])
+    out.append("")
+    out.append("Matching documents: " + (", ".join(res["matching"]) or "(none)"))
+    out.append(f"\nQuery vector length = {res['length']:.6f}")
+    out.append("Query term".ljust(14) + "Weighted TF".rjust(12) + "Query TF-IDF".rjust(14) + "Normalized".rjust(12))
+    for w in res["weights"]:
+        out.append(w.ljust(14) + f"{1 + math.log10(res['counts'][w]):.4f}".rjust(12)
+                   + f"{res['weights'][w]:.4f}".rjust(14) + f"{res['normalized'][w]:.4f}".rjust(12))
+    if res["matching"]:
+        out.append("\n" + "Matched doc".ljust(14) + "Similarity".rjust(12))
+        for d in res["matching"]:
+            out.append(d.ljust(14) + f"{res['sims'][d]:.4f}".rjust(12))
+        out.append("Ranking (highest similarity first): " + " > ".join(res["ranking"]))
+    return "\n".join(out)
