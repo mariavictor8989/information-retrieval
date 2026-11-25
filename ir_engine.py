@@ -66,9 +66,7 @@ def natural_key(name):
     return [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", name.lower())]
 
 
-# ---------------------------------------------------------------------------
 # 1. Read the documents
-# ---------------------------------------------------------------------------
 def read_documents(folder):
     """Return ([(doc_id, text), ...], how the files were read)."""
     folder = os.path.abspath(folder)
@@ -93,9 +91,7 @@ def read_documents(folder):
     return docs, how
 
 
-# ---------------------------------------------------------------------------
 # 2. Positional index with Spark
-# ---------------------------------------------------------------------------
 def build_index(docs):
     """Return {term: {doc_id: [positions]}} (positions start at 1)."""
     sc = get_sc()
@@ -119,9 +115,8 @@ def build_index(docs):
     return index
 
 
-# ---------------------------------------------------------------------------
 # 3. TF, DF, IDF, TF-IDF, lengths, normalization
-# ---------------------------------------------------------------------------
+
 def calculate_weights(index, doc_ids):
     N = len(doc_ids)
     terms = sorted(index)
@@ -156,9 +151,8 @@ def load_dataset(folder):
     return ir
 
 
-# ---------------------------------------------------------------------------
+
 # Tables as text
-# ---------------------------------------------------------------------------
 def matrix_text(ir, name):
     terms, doc_ids = ir["terms"], ir["doc_ids"]
     w = max(len(t) for t in terms) + 2
@@ -207,9 +201,7 @@ def tables(ir):
             ("Normalized TF-IDF", matrix_text(ir, "norm"))]
 
 
-# ---------------------------------------------------------------------------
 # 4. Search
-# ---------------------------------------------------------------------------
 def find(ir, words):
     """Documents where the words appear next to each other, in this order.
     Returns {doc_id: [start positions]}. One word = normal term search."""
